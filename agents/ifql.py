@@ -120,6 +120,14 @@ class IFQLAgent(flax.struct.PyTreeNode):
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
+    def sample_training_x0(self, batch):
+        """Reconstruct the x_0 noise batch used by the current training step."""
+        _, rng = jax.random.split(self.rng)
+        _, actor_rng = jax.random.split(rng)
+        _, x_rng, _ = jax.random.split(actor_rng, 3)
+        return jax.random.normal(x_rng, batch['actions'].shape)
+
+    @jax.jit
     def sample_actions(
         self,
         observations,
