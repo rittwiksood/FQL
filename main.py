@@ -42,6 +42,7 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
 flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling for online fine-tuning.')
+flags.DEFINE_integer('x0_save_interval', 100, 'Number of iterations between x_0 file flushes.')
 
 config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
 
@@ -91,6 +92,9 @@ def main(_):
 
     # Create agent.
     example_batch = train_dataset.sample(1)
+    total_steps = FLAGS.offline_steps + FLAGS.online_steps
+    x0_path = os.path.join(FLAGS.save_dir, 'x0_all.npy')
+    x0_mm = None
 
     agent_class = agents[config['agent_name']]
     agent = agent_class.create(
@@ -103,6 +107,38 @@ def main(_):
     # Restore agent.
     if FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
+
+    def export_x0_hat(dataset, output_path):
+        if not hasattr(agent, 'compute_reverse_flow_actions'):
+            raise ValueError(
+                f"Agent '{config['agent_name']}' does not implement compute_reverse_flow_actions; "
+                'x_0_hat export is only supported for flow-based agents with a reverse integrator.'
+            )
+        if dataset.size == 0:
+            return
+
+        x0_hat_mm = np.lib.format.open_memmap(
+            output_path,
+            mode='w+',
+            dtype=np.float32,
+            shape=(dataset.size, *dataset['actions'].shape[1:]),
+        )
+        for start in tqdm.tqdm(
+            range(0, dataset.size, config['batch_size']),
+            desc='Saving x_0_hat',
+            dynamic_ncols=True,
+            leave=False,
+        ):
+            end = min(start + config['batch_size'], dataset.size)
+            batch = dataset.get_subset(np.arange(start, end))
+            x0_hat_batch = np.array(
+                agent.compute_reverse_flow_actions(batch['observations'], batch['actions']),
+                dtype=np.float32,
+            )
+            x0_hat_mm[start:end] = x0_hat_batch
+
+        x0_hat_mm.flush()
+        del x0_hat_mm
 
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
@@ -118,11 +154,6 @@ def main(_):
         if i <= FLAGS.offline_steps:
             # Offline RL.
             batch = train_dataset.sample(config['batch_size'])
-
-            if config['agent_name'] == 'rebrac':
-                agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
-            else:
-                agent, update_info = agent.update(batch)
         else:
             # Online fine-tuning.
             online_rng, key = jax.random.split(online_rng)
@@ -169,10 +200,28 @@ def main(_):
             else:
                 batch = replay_buffer.sample(config['batch_size'])
 
-            if config['agent_name'] == 'rebrac':
-                agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
-            else:
-                agent, update_info = agent.update(batch)
+        if hasattr(agent, 'sample_training_x0'):
+            x0_batch = np.array(agent.sample_training_x0(batch), dtype=np.float32)
+            if x0_mm is None:
+                x0_mm = np.lib.format.open_memmap(
+                    x0_path,
+                    mode='w+',
+                    dtype=np.float32,
+                    shape=(total_steps, *x0_batch.shape),
+                )
+            elif x0_mm.shape[1:] != x0_batch.shape:
+                raise ValueError(
+                    f"x_0 batch shape changed from {x0_mm.shape[1:]} to {x0_batch.shape}; "
+                    "saving all x_0 values in one dense file requires a fixed batch shape."
+                )
+            x0_mm[i - 1] = x0_batch
+            if i % FLAGS.x0_save_interval == 0:
+                x0_mm.flush()
+
+        if config['agent_name'] == 'rebrac':
+            agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
+        else:
+            agent, update_info = agent.update(batch)
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
@@ -215,6 +264,10 @@ def main(_):
         if i % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, i)
 
+    if x0_mm is not None:
+        x0_mm.flush()
+        del x0_mm
+    export_x0_hat(train_dataset, os.path.join(FLAGS.save_dir, 'x0_hat_all.npy'))
     train_logger.close()
     eval_logger.close()
 
