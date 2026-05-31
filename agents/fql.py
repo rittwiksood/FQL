@@ -133,6 +133,14 @@ class FQLAgent(flax.struct.PyTreeNode):
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
+    def sample_training_x0(self, batch):
+        """Reconstruct the x_0 noise batch used by the current training step."""
+        _, rng = jax.random.split(self.rng)
+        _, actor_rng, _ = jax.random.split(rng, 3)
+        _, x_rng, _ = jax.random.split(actor_rng, 3)
+        return jax.random.normal(x_rng, batch['actions'].shape)
+
+    @jax.jit
     def sample_actions(
         self,
         observations,
@@ -169,6 +177,24 @@ class FQLAgent(flax.struct.PyTreeNode):
             actions = actions + vels / self.config['flow_steps']
         actions = jnp.clip(actions, -1, 1)
         return actions
+
+    @jax.jit
+    def compute_reverse_flow_actions(
+        self,
+        observations,
+        x_1,
+    ):
+        """Estimate x_0 by integrating the BC flow model backward from x_1."""
+        if self.config['encoder'] is not None:
+            observations = self.network.select('actor_bc_flow_encoder')(observations)
+        dt = 1.0 / self.config['flow_steps']
+        x = x_1
+        # Reverse Euler method.
+        for i in range(self.config['flow_steps'], 0, -1):
+            t = jnp.full((*observations.shape[:-1], 1), i / self.config['flow_steps'])
+            pred = self.network.select('actor_bc_flow')(observations, x, t, is_encoded=True)
+            x = x - pred * dt
+        return x
 
     @classmethod
     def create(
